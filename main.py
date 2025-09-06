@@ -232,13 +232,31 @@ def auto_locate_grid(warp: np.ndarray, preset: GridPreset) -> List[Tuple[int,int
 
     return [tuple(m) for m in merged]
 
+def _enhance_gray(gray: np.ndarray) -> np.ndarray:
+    """ปรับคอนทราสต์แบบโลคัล (CLAHE) แล้ว normalize แสงเงา ให้ฟองซีดอ่านขึ้น"""
+    g = cv.GaussianBlur(gray, (3, 3), 0)
+    try:
+        clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        g = clahe.apply(g)
+    except Exception:
+        pass
+    return _normalize_illum(g)
+
 # ---------- Read a column with gray-based scoring ----------
 def _read_column_answers(col_img: np.ndarray, choices: List[str], rows: int) -> List[str]:
+    """
+    อ่านคอลัมน์หนึ่งแบบทนภาพมือถือ:
+      - หา center ของช่องเลือกด้วยโปรไฟล์จริง
+      - คิดสกอร์ผสม: darkness(norm) + fill_ratio(จาก Otsu) + edge(Sobel)
+      - 2-pass: ถ้าไม่ผ่านในรัศมีมาตรฐาน จะลองขยายรัศมีอีกนิด
+      - เกณฑ์เป็น adaptive ต่อแถว เพื่อลด miss/false positive
+    """
     g0 = cv.cvtColor(col_img, cv.COLOR_BGR2GRAY)
-    g  = _normalize_illum(g0)
+    g  = _enhance_gray(g0)
+
     H, W = g.shape[:2]
 
-    # 1) จำกัดช่วงแนวตั้งที่มีฟองจริง
+    # จำกัดช่วงแนวตั้งที่มีฟองจริง
     prof_v = (255 - g).sum(axis=1).astype(np.float32)
     prof_v = cv.GaussianBlur(prof_v.reshape(-1,1), (1, 31), 0).ravel()
     thr_v  = 0.05 * float(prof_v.max())
@@ -253,7 +271,7 @@ def _read_column_answers(col_img: np.ndarray, choices: List[str], rows: int) -> 
     roi = g[y_top:y_bot, :]
     HH, WW = roi.shape[:2]
 
-    # 2) หา center ของตัวเลือกในแนวนอน
+    # หา center ของตัวเลือกในแนวนอน
     mid1, mid2 = int(HH*0.20), int(HH*0.80)
     band = roi[mid1:mid2, :]
     xprof = (255 - band).sum(axis=0).astype(np.float32)
@@ -275,43 +293,64 @@ def _read_column_answers(col_img: np.ndarray, choices: List[str], rows: int) -> 
         slice_w = WW / nC
         centers = [int(i*slice_w + slice_w*0.5) for i in range(nC)]
 
-    # 3) วัดคะแนนแต่ละแถว
+    # รัศมีวัด
+    row_h = HH / rows
     if len(centers) >= 2:
         avg_gap = float(np.mean(np.diff(sorted(centers))))
     else:
         avg_gap = WW / max(5.0, float(nC))
-    r_base = 0.32 * min(avg_gap, HH/rows)
-    rmask  = max(5.0, r_base)
+    r_small = max(5.0, 0.32 * min(avg_gap, HH/rows))
+    r_large = r_small * 1.25  # pass2
 
-    row_h = HH / rows
-    answers: List[str] = []
-    for r in range(rows):
-        yy1 = int(r * row_h + row_h * 0.05)
-        yy2 = int((r + 1) * row_h - row_h * 0.05)
-        if yy2 <= yy1 or yy2-yy1 < 6:
-            answers.append("")
-            continue
-        cell = roi[yy1:yy2, :]
+    def score_row(cell: np.ndarray, rmask: float) -> List[float]:
         h2, w2 = cell.shape[:2]
         base = float(np.percentile(cell, 80))
         minval = float(np.percentile(cell, 10))
-        norm_dark = lambda v: (base-v)/(base-minval+1e-6)
+        norm_dark = lambda v: (base - v) / (base - minval + 1e-6)
+        th = cv.threshold(cell, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU)[1]
+        th = cv.morphologyEx(th, cv.MORPH_OPEN, np.ones((3,3), np.uint8))
+        edge = cv.Sobel(cell, cv.CV_32F, 1, 1, ksize=3)
+        edge = np.minimum(1.0, np.abs(edge) / 40.0)
 
         scores = []
         for cx in centers:
             cy = h2 * 0.5
             m  = _circle_mask(h2, w2, float(cx), float(cy), rmask)
-            mean_in  = float(cell[m].mean())
-            darkness = max(0.0, norm_dark(mean_in))
-            scores.append(darkness)
+            if m.sum() == 0:
+                scores.append(0.0); continue
+            darkness = max(0.0, norm_dark(float(cell[m].mean())))
+            fill     = float(th[m].mean()) / 255.0
+            edged    = float(edge[m].mean())
+            # น้ำหนัก: ปรับได้  (dark 55% + fill 35% + edge 10%)
+            scores.append(0.55*darkness + 0.35*fill + 0.10*edged)
+        return scores
 
-        best_i = int(np.argmax(scores))
-        best   = float(scores[best_i])
-        second = float(sorted(scores, reverse=True)[1]) if nC > 1 else 0.0
+    answers: List[str] = []
+    for r in range(rows):
+        yy1 = int(r * row_h + row_h * 0.05)
+        yy2 = int((r + 1) * row_h - row_h * 0.05)
+        if yy2 <= yy1 or yy2-yy1 < 6:
+            answers.append(""); continue
+        cell = roi[yy1:yy2, :]
 
-        pass_min = best > 0.22
-        pass_gap = (best-second) > 0.08
-        answers.append(choices[best_i] if (pass_min and pass_gap) else "")
+        # pass1
+        s1 = score_row(cell, r_small)
+        b1, i1 = (max(s1), int(np.argmax(s1))) if s1 else (0.0, 0)
+        std1 = float(np.std(s1)) if len(s1) > 1 else 0.0
+        gap1 = sorted(s1, reverse=True)[0] - (sorted(s1, reverse=True)[1] if len(s1) > 1 else 0.0)
+        pass_min1 = b1 > max(0.20, np.percentile(s1, 75)*0.90)
+        pass_gap1 = gap1 > max(0.06, 0.35*std1)
+        if pass_min1 and pass_gap1:
+            answers.append(choices[i1]); continue
+
+        # pass2: ขยายรัศมี + ผ่อนเกณฑ์เล็กน้อย
+        s2 = score_row(cell, r_large)
+        b2, i2 = (max(s2), int(np.argmax(s2))) if s2 else (0.0, 0)
+        std2 = float(np.std(s2)) if len(s2) > 1 else 0.0
+        gap2 = sorted(s2, reverse=True)[0] - (sorted(s2, reverse=True)[1] if len(s2) > 1 else 0.0)
+        pass_min2 = b2 > max(0.18, np.percentile(s2, 75)*0.85)
+        pass_gap2 = gap2 > max(0.05, 0.30*std2)
+        answers.append(choices[i2] if (pass_min2 and pass_gap2) else "")
 
     if SAVE_DEBUG:
         dbg = cv.cvtColor(roi, cv.COLOR_GRAY2BGR)
@@ -389,8 +428,9 @@ def extract_answer_grid_robust(warp: np.ndarray, preset: GridPreset) -> np.ndarr
     return best_img
 
 def detect_marks_gray(grid_img: np.ndarray, preset: GridPreset) -> List[str]:
+    """fallback แบบอ่านทั้งกริด แต่ใช้สกอร์/เกณฑ์เดียวกับคอลัมน์"""
     gray = cv.cvtColor(grid_img, cv.COLOR_BGR2GRAY)
-    g    = _normalize_illum(gray)
+    g    = _enhance_gray(gray)
     H,W=g.shape[:2]; rows,cols=preset.grid_rows,preset.grid_cols; nC=len(preset.choices)
     margin_y,margin_x=0.12,0.06
     cell_h,cell_w=H/rows,W/cols
@@ -403,25 +443,57 @@ def detect_marks_gray(grid_img: np.ndarray, preset: GridPreset) -> List[str]:
             for c in range(cols): pairs.append((r,c))
     answers=[]
     heat = grid_img.copy()
+
     for (r,c) in pairs:
         y1=int(r*cell_h+cell_h*margin_y); y2=int((r+1)*cell_h-cell_h*margin_y)
         x1=int(c*cell_w+cell_w*margin_x); x2=int((c+1)*cell_w-cell_w*margin_x)
         if y2-y1<6 or x2-x1<6: answers.append(""); continue
         cell=g[y1:y2,x1:x2]; h2,w2=cell.shape[:2]
-        slice_w=w2/nC; rmask=max(4.0,min(slice_w,h2)*0.22)
-        base=float(np.percentile(cell,80)); scores=[]
-        for i in range(nC):
-            cx=i*slice_w+slice_w*0.5; cy=h2*0.5
-            m=_circle_mask(h2,w2,cx,cy,rmask)
-            mean_in=float(cell[m].mean()); scores.append(max(0.0, base-mean_in))
-            if SAVE_DEBUG:
-                cv.circle(heat, (x1+int(cx), y1+int(cy)), int(rmask), (0,255,255), 1)
-        best_i=int(np.argmax(scores)); best=float(scores[best_i])
-        second=float(sorted(scores,reverse=True)[1]) if nC>1 else 0.0
+        slice_w=w2/nC
+        r_small=max(4.0,min(slice_w,h2)*0.22)
+        r_large=r_small*1.25
+
+        def score_cell(rmask: float) -> List[float]:
+            base=float(np.percentile(cell,80))
+            minv=float(np.percentile(cell,10))
+            norm_dark=lambda v:(base-v)/(base-minv+1e-6)
+            th=cv.threshold(cell,0,255,cv.THRESH_BINARY_INV+cv.THRESH_OTSU)[1]
+            th=cv.morphologyEx(th,cv.MORPH_OPEN,np.ones((3,3),np.uint8))
+            edge=cv.Sobel(cell,cv.CV_32F,1,1,ksize=3); edge=np.minimum(1.0,np.abs(edge)/40.0)
+            scores=[]
+            for i in range(nC):
+                cx=i*slice_w+slice_w*0.5; cy=h2*0.5
+                m=_circle_mask(h2,w2,cx,cy,rmask)
+                if m.sum()==0: scores.append(0.0); continue
+                darkness=max(0.0,norm_dark(float(cell[m].mean())))
+                fill=float(th[m].mean())/255.0
+                e=float(edge[m].mean())
+                scores.append(0.55*darkness+0.35*fill+0.10*e)
+            return scores
+
+        s1=score_cell(r_small)
+        b1,i1=(max(s1),int(np.argmax(s1))) if s1 else (0.0,0)
+        std1=float(np.std(s1)) if len(s1)>1 else 0.0
+        gap1=sorted(s1,reverse=True)[0]-(sorted(s1,reverse=True)[1] if len(s1)>1 else 0.0)
+        pass_min=b1>max(0.22,np.percentile(s1,75)*0.90)
+        pass_gap=gap1>max(0.06,0.35*std1)
+        if pass_min and pass_gap:
+            pick=i1
+        else:
+            s2=score_cell(r_large)
+            b2,i2=(max(s2),int(np.argmax(s2))) if s2 else (0.0,0)
+            std2=float(np.std(s2)) if len(s2)>1 else 0.0
+            gap2=sorted(s2,reverse=True)[0]-(sorted(s2,reverse=True)[1] if len(s2)>1 else 0.0)
+            pass_min2=b2>max(0.18,np.percentile(s2,75)*0.85)
+            pass_gap2=gap2>max(0.05,0.30*std2)
+            pick=i2 if (pass_min2 and pass_gap2) else -1
+
+        answers.append(preset.choices[pick] if pick>=0 else "")
         if SAVE_DEBUG:
-            cv.putText(heat, f"{best:.1f}", (x1+5, y1+14), cv.FONT_HERSHEY_SIMPLEX, 0.38, (0,255,0), 1, cv.LINE_AA)
-        pass_min=best>2.2; pass_gap=(best-second)>0.7
-        answers.append(preset.choices[best_i] if (pass_min and pass_gap) else "")
+            rad=int(r_small if pick>=0 else r_large)
+            cx=int((pick if pick>=0 else 0)*slice_w+slice_w*0.5)
+            cv.circle(heat,(x1+cx,int((y1+y2)//2)),rad,(0,255,255),1)
+
     if SAVE_DEBUG:
         cv.imwrite(os.path.join("data/debug", f"heat_{int(time.time())}.jpg"), heat)
     return answers
