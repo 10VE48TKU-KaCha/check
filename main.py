@@ -4,6 +4,7 @@
 import io
 
 import os, json, time, uuid, shutil
+import traceback  # <--- เพิ่มบรรทัดนี้
 from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Dict, Tuple, Optional
@@ -20,10 +21,12 @@ from grid_presets import PRESETS, GridPreset  # ต้องมี A5_60Q_5C_ID
 
 # ================= Layout mapping (สัมพัทธ์ภายใน "กรอบแดง" =================
 # ปรับตัวเลขเหล่านี้ให้ตรงฟอร์มของคุณได้ (0..1 ของกรอบแดงที่ warp แล้ว)
-ID_FRAC_IN_FRAME   = (0.06, 0.14, 0.30, 0.45)  # น้ำเงิน: รหัสนักเรียน (คอลัมน์เดียว 0-9 หลายหลัก)
-ANS_TR_FRAC        = (0.38, 0.14, 0.56, 0.34)  # เขียว: บนขวา 2 คอลัมน์ × 10 แถว
-ANS_BOTTOM_FRAC    = (0.11, 0.54, 0.80, 0.37)  # แดง: ล่าง 4 คอลัมน์ × 10 แถว
-BOUNDING_ANS_ROI   = (0.15, 0.14, 0.78, 0.75)  # fallback เมื่อหา frame ไม่เจอ
+# --- Final Version: Fine-tuned for both portrait and rotated layouts ---
+ID_FRAC_IN_FRAME   = (0.04, 0.07, 0.32, 0.42)  # กรอบรหัสนักเรียน
+ANS_TR_FRAC        = (0.39, 0.07, 0.58, 0.42)  # กรอบข้อ 1-20
+ANS_BOTTOM_FRAC    = (0.04, 0.51, 0.93, 0.45)  # กรอบข้อ 21-60
+BOUNDING_ANS_ROI   = (0.04, 0.07, 0.93, 0.89)  # fallback เมื่อหา frame ไม่เจอ
+
 
 # ================= เตรียมโฟลเดอร์ =================
 for d in ["data/uploads", "data/keys_json", "data/results", "data/debug"]:
@@ -410,9 +413,24 @@ def _score_vector(cell: np.ndarray, centers: List[int], r_in: float) -> List[flo
 
 def _find_centers_from_band(roi: np.ndarray, n_choices: int) -> List[int]:
     HH, WW = roi.shape[:2]
+
+    # --- ADD THIS SANITY CHECK ---
+    if WW < n_choices:
+        # If the ROI is narrower than the number of choices, we can't find distinct peaks.
+        # Return evenly spaced points as a robust fallback.
+        slice_w = WW / max(1, n_choices)
+        return [int(i * slice_w + slice_w * 0.5) for i in range(n_choices)]
+    # -----------------------------
+
     band = roi[int(HH*0.20):int(HH*0.80), :]
     xprof = (255 - band).sum(axis=0).astype(np.float32)
     xprof = safe_blur(xprof.reshape(1,-1), (151,1), 0).ravel()
+    
+    # Add another check for profile length after processing
+    if xprof.size < n_choices:
+        slice_w = WW / max(1, n_choices)
+        return [int(i * slice_w + slice_w * 0.5) for i in range(n_choices)]
+
     idx = np.argpartition(xprof, -n_choices)[-n_choices:]; idx = np.sort(idx)
     centers = []
     if len(idx) == n_choices:
@@ -461,7 +479,7 @@ def _read_column_answers(col_img: np.ndarray, choices: List[str], rows: int):
     ys     = np.where(prof_v > thr_v)[0]
     if len(ys) > 0: y_top, y_bot = int(ys[0]), int(ys[-1])
     else:           y_top, y_bot = int(H*0.15), int(H*0.96)
-    y_top = max(0, y_top - int(0.03*H)); y_bot = min(H, y_bot + int(0.02*H))
+    # y_top = max(0, y_top - int(0.03*H)); y_bot = min(H, y_bot + int(0.02*H))
     roi = g[y_top:y_bot, :]
     if _is_small(roi, 24, 24): return ([""]*rows, [0.0]*rows, [False]*rows)
     HH, WW = roi.shape[:2]
@@ -644,33 +662,11 @@ def find_and_warp(img_bgr: np.ndarray) -> np.ndarray:
     return four_point_transform(img_bgr, corners)
 
 def ensure_portrait_upright(warp: np.ndarray, preset: GridPreset) -> np.ndarray:
-    """
-    บังคับแนวตั้ง + เลือกด้านที่ถูกต้องให้ชัวร์
-    ลองหมุน 0/90/180/270 องศาหลังวอร์ป แล้วให้คะแนนจากการอ่านรหัสนักเรียน
-    """
-    # หมุน 4 แบบหลังวอร์ป
-    rots = [None, cv.ROTATE_90_CLOCKWISE, cv.ROTATE_180, cv.ROTATE_90_COUNTERCLOCKWISE]
-    best_img, best_score = None, -1e9
-
-    for rot in rots:
-        cand = warp if rot is None else cv.rotate(warp, rot)
-
-        # บังคับให้เป็น "แนวตั้ง" เสมอ (H > W)
-        if cand.shape[0] < cand.shape[1]:
-            cand = cv.rotate(cand, cv.ROTATE_90_COUNTERCLOCKWISE)
-
-        # ให้คะแนนจากการอ่านรหัสนักเรียน (ลองทั้ง flip_h = False/True)
-        for fh in (False, True):
-            sid, conf, multi = read_student_id(cand, preset, flip_h=fh)
-            ok_digits = sum(1 for ch in sid if ch != "?")
-            mean_conf = float(np.mean(conf)) if conf else 0.0
-            score = ok_digits + 0.35 * mean_conf - 0.5 * sum(1 for m in multi if m)
-
-            if score > best_score:
-                best_score = score
-                best_img = cand
-
-    return best_img
+    """บังคับแนวตั้ง (H > W) เท่านั้น ไม่ตัดสิน 0°/180° ที่นี่"""
+    img = warp
+    if img.shape[0] < img.shape[1]:
+        img = cv.rotate(img, cv.ROTATE_90_COUNTERCLOCKWISE)
+    return img
 
 # ================= Student ID =================
 def read_student_id(warp: np.ndarray, preset: GridPreset, flip_h: bool=False) -> Tuple[str, List[float], List[bool]]:
@@ -770,56 +766,6 @@ def draw_overlay_with_key(warp: np.ndarray, preset: GridPreset,
         offset += z.cols*z.rows_per_col
     return out
 
-# ================= Any-orientation wrapper =================
-def get_all_any_orientation(img_bgr: np.ndarray, preset: GridPreset):
-    rotations = [None, cv.ROTATE_90_CLOCKWISE, cv.ROTATE_180, cv.ROTATE_90_COUNTERCLOCKWISE]
-    best_pack = None
-    best_score = -1
-    last_err = None
-
-    for rot in rotations:
-        try:
-            test = img_bgr if rot is None else cv.rotate(img_bgr, rot)
-            warped_raw = find_and_warp(test)
-
-            # บังคับ H>W แต่ยังไม่ฟันธงหัว-ท้าย
-            base = ensure_portrait_upright(warped_raw, preset)
-
-            # ลองทั้ง 0° และ 180°
-            for orient in (None, cv.ROTATE_180):
-                warped = base if orient is None else cv.rotate(base, orient)
-
-                for flip_h in (False, True):
-                    ans, conf, multi = get_answers_from_warp(warped, preset, flip_h)
-                    sid, sid_conf, sid_multi = read_student_id(warped, preset, flip_h)
-
-                    non_empty = sum(1 for a in ans if a)
-                    mean_ans_c = float(np.mean([c for a, c in zip(ans, conf) if a])) if non_empty else 0.0
-                    ok_digits = sum(1 for ch in sid if ch != "?")
-                    multi_pen = sum(1 for m in multi if m) + sum(1 for m in sid_multi if m)
-                    score = non_empty + 0.25*mean_ans_c + 0.6*ok_digits - 0.3*multi_pen
-
-                    pack = (ans, conf, multi, sid, sid_conf, sid_multi, warped, rot, flip_h)
-                    if score > best_score:
-                        best_score = score
-                        best_pack = pack
-
-        except Exception as e:
-            last_err = e
-            continue
-
-    if best_pack is None:
-        raise HTTPException(422, f"อ่านภาพไม่สำเร็จ (ไม่พบมุมหรือกริด): {last_err}")
-
-    # ⬇⬇⬇ Force portrait & re-read ⬇⬇⬇
-    ans, conf, multi, sid, sid_conf, sid_multi, warped, rot, flip_h = best_pack
-    if warped.shape[0] < warped.shape[1]:
-        warped = cv.rotate(warped, cv.ROTATE_90_COUNTERCLOCKWISE)
-        # อ่านใหม่จากภาพที่หมุนให้เป็นแนวตั้งแล้ว
-        ans, conf, multi = get_answers_from_warp(warped, preset, flip_h)
-        sid, sid_conf, sid_multi = read_student_id(warped, preset, flip_h)
-
-    return (ans, conf, multi, sid, sid_conf, sid_multi, warped, rot, flip_h)
 
 # ================= Keys / Compare =================
 def compute_correctness(student_ans: List[str], key_ans: List[str]) -> List[bool]:
@@ -1032,7 +978,7 @@ def check_page():
       <a class="btn sub" href="/">กลับหน้าแรก</a>
     </div>
 
-    <div id="sum" style="display:none;margin-top:14px;display:flex;gap:16px;align-items:center">
+    <div id="sum" style="display:none;margin-top:14px;gap:16px;align-items:center">
       <div class="donut" id="donut" style="--p:0"><b id="pct">0%</b></div>
       <div>
         <div class="label">ผลรวม</div>
@@ -1248,19 +1194,53 @@ async def grade_a5(subject: str = Form(...), image: UploadFile = File(...)):
 
     quality = image_quality_report(img_bgr)
 
-    # ใช้ตัวที่ลองหมุนและลอง flip_h ให้แล้ว
-    student_ans, confidences, multimarks, student_id, sid_conf, sid_multi, warped, _rot, flip_h = \
-        get_all_any_orientation(img_bgr, preset)
+    try:
+        # 1. Warp the image. This 'warped_image' is now our clean, upright canvas.
+        warped_image = find_and_warp(img_bgr)
 
+        best_pack = None
+        best_score = -1
+
+        # 2. Create orientations to test for reading marks
+        orientations = [(warped_image, 0)]
+        orientations.append((cv.rotate(warped_image, cv.ROTATE_180), 180))
+
+        for warped_test, angle in orientations:
+             for flip_h in (False, True):
+                ans, conf, multi = get_answers_from_warp(warped_test, preset, flip_h)
+                sid, sid_conf, sid_multi = read_student_id(warped_test, preset, flip_h)
+
+                non_empty = sum(1 for a in ans if a)
+                ok_digits = sum(1 for ch in sid if ch != "?")
+                score = non_empty + ok_digits
+
+                if score > best_score:
+                    best_score = score
+                    # Store the results, but not the warped image itself yet
+                    best_pack = (ans, conf, multi, sid, sid_conf, sid_multi, flip_h)
+
+        if best_pack is None:
+            raise HTTPException(422, "Could not read marks from the image.")
+
+        student_ans, confidences, multimarks, student_id, sid_conf, sid_multi, final_flip_h = best_pack
+
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=422, detail=f"Failed to process image: {e}")
+    
     correctness = compute_correctness(student_ans, key_list)
     total_correct = int(sum(correctness))
 
-    overlay = draw_overlay_with_key(warped, preset, student_ans, key_list, flip_h=flip_h)
+    # --- FINAL FIX: Always draw on the original, upright warped_image ---
+    overlay = draw_overlay_with_key(warped_image, preset, student_ans, key_list, flip_h=final_flip_h)
+    
     rid = f"{subject}__{int(time.time())}__{uuid.uuid4().hex}"
     overlay_path = os.path.join("data/debug", f"{rid}__overlay.jpg")
     if SAVE_DEBUG:
+        # Save the final, correctly-drawn overlay
         cv.imwrite(overlay_path, overlay)
-        cv.imwrite(os.path.join("data/debug", f"{rid}__warped.jpg"), warped)
+        # Always save the upright warped image for consistency
+        cv.imwrite(os.path.join("data/debug", f"{rid}__warped.jpg"), warped_image)
 
     low_conf_idx = [i for i,(a,c) in enumerate(zip(student_ans,confidences)) if a and c < 0.15]
     multi_idx    = [i for i,m in enumerate(multimarks) if m]
@@ -1280,7 +1260,7 @@ async def grade_a5(subject: str = Form(...), image: UploadFile = File(...)):
         flags=Flags(low_conf=low_conf_idx, multi_mark=multi_idx, id_multi=id_multi_idx),
         quality=QualityReport(**quality),
         overlay_path=overlay_path,
-        engine="a5_smart_v2"
+        engine="a5_portrait_stable"
     )
 
 # --------- peek ----------
@@ -1411,7 +1391,7 @@ def read_a5_page():
       <button id="btn" class="btn">อ่าน</button>
       <a class="btn sub" href="/">กลับหน้าแรก</a>
     </div>
-    <div id="sum" style="display:none;margin-top:12px">
+    <div id="sum" style="display:none;margin-top:14px;gap:16px;align-items:center">
       <div class="kv">
         <div class="label">รหัสนักเรียน</div>
         <div class="code"><b id="sid">-</b> <button id="copy" class="btn sub" style="padding:6px 10px;margin-left:8px">คัดลอก</button></div>
